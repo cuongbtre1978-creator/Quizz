@@ -1,0 +1,1093 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hóa Học Quiz - Trợ lí CL</title>
+
+  <!-- 1. Cài đặt Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- 2. Custom CSS & Animations -->
+  <style>
+    @layer utilities {
+      .animate-fade-in {
+        animation: fadeIn 0.3s ease-in-out;
+      }
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: #f9fafb;
+    }
+  </style>
+
+  <!-- 3. Nhúng Firebase (Phiên bản Compat để chạy trực tiếp trên HTML) -->
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+
+  <!-- 4. Nhúng React và Babel -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <!-- Container gốc cho ứng dụng React -->
+  <div id="root"></div>
+
+  <!-- 5. Toàn bộ Logic Ứng Dụng -->
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    // ============================================================================
+    // A. CẤU HÌNH FIREBASE & CHẾ ĐỘ LOCAL OFFLINE
+    // ============================================================================
+    const isLocalDemo = typeof __firebase_config === 'undefined';
+    
+    let parsedConfig = { apiKey: "demo-key", projectId: "demo-project" };
+    if (!isLocalDemo) {
+      try {
+        parsedConfig = typeof __firebase_config === 'string' ? JSON.parse(__firebase_config) : __firebase_config;
+      } catch (e) {
+        console.error("Lỗi parse cấu hình Firebase:", e);
+      }
+    }
+    
+    if (!firebase.apps.length) {
+        firebase.initializeApp(parsedConfig);
+    }
+    
+    const auth = firebase.auth();
+    const db = firebase.firestore();
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'chem-quiz-app';
+
+    // ---- MOCK DATABASE CHO CHẾ ĐỘ CHẠY OFFLINE TRÊN MÁY TÍNH ----
+    const localDB = {};
+    const listeners = {};
+    const channel = (isLocalDemo && typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('chem_quiz_sync') : null;
+
+    if (channel) {
+      channel.onmessage = (e) => {
+        if (e.data.type === 'SET') {
+          const { path, data } = e.data;
+          localDB[path] = data;
+          if (listeners[path]) listeners[path]({ get exists() { return true; }, data: () => localDB[path] });
+        }
+      };
+    }
+
+    const getDbRef = (roomId) => {
+      const path = `rooms/${roomId}`;
+      if (isLocalDemo) {
+        return {
+          get: async () => ({ get exists() { return !!localDB[path]; }, data: () => localDB[path] }),
+          set: async (data) => {
+            localDB[path] = data;
+            if (channel) channel.postMessage({ type: 'SET', path, data });
+            if (listeners[path]) listeners[path]({ get exists() { return true; }, data: () => localDB[path] });
+          },
+          update: async (data) => {
+            let current = localDB[path] || {};
+            const updated = JSON.parse(JSON.stringify(current));
+            for (let key in data) {
+              const parts = key.split('.');
+              let ref = updated;
+              for (let i = 0; i < parts.length - 1; i++) {
+                if (!ref[parts[i]]) ref[parts[i]] = {};
+                ref = ref[parts[i]];
+              }
+              ref[parts[parts.length - 1]] = data[key];
+            }
+            localDB[path] = updated;
+            if (channel) channel.postMessage({ type: 'SET', path, data: updated });
+            if (listeners[path]) listeners[path]({ get exists() { return true; }, data: () => localDB[path] });
+          },
+          onSnapshot: (callback) => {
+            listeners[path] = callback;
+            callback({ get exists() { return !!localDB[path]; }, data: () => localDB[path] });
+            return () => { delete listeners[path]; };
+          }
+        };
+      }
+      // Dùng CSDL Firebase thật nếu có kết nối
+      return db.collection('artifacts').doc(appId).collection('public').doc('data').collection('rooms').doc(roomId);
+    };
+
+    // ============================================================================
+    // B. TIỆN ÍCH & CHUẨN HÓA CÔNG THỨC
+    // ============================================================================
+    const formatChem = (text) => {
+      if (!text) return '';
+      const subMap = { '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉' };
+      const supMap = { '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '+': '⁺', '-': '⁻' };
+
+      let formatted = text.replace(/\^([0-9+-]+)/g, (match, p1) => p1.split('').map(c => supMap[c] || c).join(''));
+      formatted = formatted.replace(/([A-Za-z\)])(\d*[+-])(?=\s|$)/g, (match, p1, p2) => p1 + p2.split('').map(c => supMap[c] || c).join(''));
+      formatted = formatted.replace(/([A-Za-z\)])(\d+)/g, (match, p1, p2) => p1 + p2.split('').map(c => subMap[c] || c).join(''));
+      return formatted;
+    };
+
+    const ChemText = ({ text, className }) => {
+      if (!text) return null;
+      return <span className={className} dangerouslySetInnerHTML={{ __html: formatChem(text) }} />;
+    };
+
+    // ============================================================================
+    // C. BỘ PHÂN TÍCH CÂU HỎI (PARSER)
+    // ============================================================================
+    const parseQuestions = (text) => {
+      const lines = text.split('\n');
+      const questions = [];
+      let currentTopic = 'Chung';
+      let currentQuestion = null;
+      let currentOption = null;
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        const topicMatch = line.match(/^Chủ đề\s+(.*?):\s+Câu/i) || line.match(/^Chủ đề\s+(.*)/i);
+        if (topicMatch) {
+          currentTopic = topicMatch[1].trim();
+          continue;
+        }
+
+        const qMatch = line.match(/^Câu\s+(\d+):\s*(.*)/i);
+        if (qMatch) {
+          if (currentQuestion) questions.push(currentQuestion);
+          currentQuestion = {
+            topic: currentTopic,
+            questionNumber: parseInt(qMatch[1], 10),
+            question: qMatch[2].trim(),
+            questionImage: null,
+            options: {
+              A: { text: null, image: null },
+              B: { text: null, image: null },
+              C: { text: null, image: null },
+              D: { text: null, image: null }
+            },
+            correctAnswer: null,
+            timeLimit: 20,
+            difficulty: 'medium'
+          };
+          currentOption = null;
+          continue;
+        }
+
+        const imgMatch = line.match(/\[(?:IMAGE|IMAGE_URL):\s*(.*?)\]/i);
+        if (imgMatch && currentQuestion && !currentOption && !line.match(/^[A-D][\.\:]/i)) {
+          currentQuestion.questionImage = imgMatch[1].trim();
+          continue;
+        }
+
+        const optMatch = line.match(/^([A-D])[\.\:]\s*(.*)/i);
+        if (optMatch && currentQuestion) {
+          const optKey = optMatch[1].toUpperCase();
+          let optText = optMatch[2].trim();
+          
+          const inlineImg = optText.match(/\[(?:IMAGE|IMAGE_URL):\s*(.*?)\]/i);
+          let optImg = null;
+          if (inlineImg) {
+            optImg = inlineImg[1].trim();
+            optText = optText.replace(/\[(?:IMAGE|IMAGE_URL):\s*(.*?)\]/i, '').trim();
+          }
+          
+          currentQuestion.options[optKey].text = optText || null;
+          if (optImg) currentQuestion.options[optKey].image = optImg;
+          
+          currentOption = optKey;
+          continue;
+        }
+
+        if (imgMatch && currentQuestion && currentOption) {
+          currentQuestion.options[currentOption].image = imgMatch[1].trim();
+          continue;
+        }
+
+        const ansMatch = line.match(/^Đáp án đúng:\s*([A-D])/i);
+        if (ansMatch && currentQuestion) {
+          currentQuestion.correctAnswer = ansMatch[1].toUpperCase();
+          continue;
+        }
+
+        if (currentQuestion && !currentOption && !ansMatch && !optMatch && !imgMatch && !line.match(/^===/)) {
+          currentQuestion.question += " " + line;
+        }
+      }
+
+      if (currentQuestion) questions.push(currentQuestion);
+      return questions;
+    };
+
+    // ============================================================================
+    // D. LOGIC CHẤM ĐIỂM
+    // ============================================================================
+    const calculateScore = (answer, correctAnswer, timeTaken, timeLimit) => {
+      if (answer !== correctAnswer) {
+        return { score: 0, isFast: false, isCorrect: false };
+      }
+      const isFast = timeTaken <= (timeLimit / 2);
+      return { score: isFast ? 1 : 0.5, isFast, isCorrect: true };
+    };
+
+    const rankStudents = (studentsObj) => {
+      if (!studentsObj) return [];
+      const list = Object.entries(studentsObj).map(([id, data]) => ({
+        id,
+        ...data,
+        avgTime: data.totalQuestionsAnswered ? (data.totalTime / data.totalQuestionsAnswered) : 999
+      }));
+
+      list.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        if (b.fastCorrects !== a.fastCorrects) return b.fastCorrects - a.fastCorrects;
+        return a.avgTime - b.avgTime;
+      });
+
+      return list.map((student, index) => {
+        const rank = index + 1;
+        let topGroup = null;
+        if (rank <= 5) topGroup = 1;
+        else if (rank <= 20) topGroup = 2;
+        else if (rank <= 30) topGroup = 3;
+
+        return { ...student, rank, topGroup };
+      });
+    };
+
+    // ============================================================================
+    // E. CÁC COMPONENT GIAO DIỆN CHUNG
+    // ============================================================================
+
+    const ImageModal = ({ src, onClose }) => {
+      if (!src) return null;
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4" onClick={onClose}>
+          <div className="relative max-w-5xl max-h-[90vh] p-2 bg-white rounded-xl shadow-2xl" onClick={e => e.stopPropagation()}>
+            <button onClick={onClose} className="absolute -top-4 -right-4 bg-white text-gray-800 hover:text-red-500 rounded-full w-10 h-10 flex items-center justify-center shadow-md font-bold text-xl">✕</button>
+            <img src={src} alt="Zoomed View" className="max-w-full max-h-[85vh] object-contain rounded-lg" />
+          </div>
+        </div>
+      );
+    };
+
+    const CountdownScreen = ({ countdownAt }) => {
+      const [count, setCount] = useState(3);
+      
+      useEffect(() => {
+        const interval = setInterval(() => {
+          const elapsed = (Date.now() - countdownAt) / 1000;
+          const remain = Math.ceil(3 - elapsed);
+          if (remain >= 0) setCount(remain);
+        }, 100);
+        return () => clearInterval(interval);
+      }, [countdownAt]);
+
+      return (
+        <div className="flex flex-col items-center justify-center h-64 animate-fade-in my-10">
+          <div className="text-9xl font-black text-green-500 animate-pulse drop-shadow-md">
+            {count > 0 ? count : 'GO!'}
+          </div>
+          <p className="text-2xl text-gray-500 mt-6 font-bold">Chuẩn bị sẵn sàng...</p>
+        </div>
+      );
+    };
+
+    const TimerBar = ({ startTime, timeLimit, onTimeUp }) => {
+      const [timeLeft, setTimeLeft] = useState(timeLimit);
+      const [progress, setProgress] = useState(100);
+
+      useEffect(() => {
+        const interval = setInterval(() => {
+          const elapsed = (Date.now() - startTime) / 1000;
+          const remain = Math.max(0, timeLimit - elapsed);
+          setTimeLeft(remain);
+          setProgress((remain / timeLimit) * 100);
+          
+          if (remain === 0) {
+            clearInterval(interval);
+            if (onTimeUp) onTimeUp();
+          }
+        }, 100);
+        return () => clearInterval(interval);
+      }, [startTime, timeLimit, onTimeUp]);
+
+      let barColor = "bg-green-500";
+      if (progress < 50) barColor = "bg-yellow-400";
+      if (progress < 25) barColor = "bg-red-500 animate-pulse";
+
+      return (
+        <div className="w-full mb-6">
+          <div className="flex justify-between items-center mb-2 font-bold">
+            <span className="text-gray-600">Thời gian còn lại:</span>
+            <span className={`text-xl ${progress < 25 ? 'text-red-600' : 'text-gray-800'}`}>{Math.ceil(timeLeft)}s</span>
+          </div>
+          <div className="w-full bg-gray-200 rounded-full h-4 overflow-hidden shadow-inner">
+            <div className={`h-4 rounded-full transition-all duration-100 linear ${barColor}`} style={{ width: `${progress}%` }}></div>
+          </div>
+        </div>
+      );
+    };
+
+    const Leaderboard = ({ students, questionsCount }) => {
+      return (
+        <div className="w-full bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+          <div className="bg-green-600 px-6 py-4 flex justify-between items-center text-white">
+            <h3 className="font-bold text-xl">Bảng Xếp Hạng</h3>
+            <span className="bg-white/20 px-3 py-1 rounded-full text-sm font-semibold">{students.length} học sinh</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse min-w-[600px]">
+              <thead>
+                <tr className="bg-gray-50 border-b border-gray-100 text-gray-600 text-sm">
+                  <th className="py-3 px-4 font-semibold w-16 text-center">Hạng</th>
+                  <th className="py-3 px-4 font-semibold">Học sinh</th>
+                  <th className="py-3 px-4 font-semibold text-center">Điểm</th>
+                  <th className="py-3 px-4 font-semibold text-center">Đúng/Sai</th>
+                  <th className="py-3 px-4 font-semibold text-center">Tốc độ</th>
+                  <th className="py-3 px-4 font-semibold">Tiến trình</th>
+                </tr>
+              </thead>
+              <tbody>
+                {students.map((student) => {
+                  let badgeClass = "w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold text-white shadow-sm mx-auto ";
+                  if (student.topGroup === 1) badgeClass += "bg-yellow-400";
+                  else if (student.topGroup === 2) badgeClass += "bg-blue-400";
+                  else if (student.topGroup === 3) badgeClass += "bg-orange-400";
+                  else badgeClass += "bg-gray-300 text-gray-600";
+
+                  return (
+                    <tr key={student.id} className="border-b border-gray-50 hover:bg-green-50/50 transition-colors">
+                      <td className="py-3 px-4"><div className={badgeClass}>{student.rank}</div></td>
+                      <td className="py-3 px-4 font-medium text-gray-800">
+                        <div className="flex items-center gap-2">
+                          {student.name}
+                          {student.streak >= 5 && <span title="Chuỗi 5+ đúng" className="text-yellow-500 text-sm">⭐</span>}
+                          {student.streak >= 3 && student.streak < 5 && <span title="Đang vào form!" className="text-orange-500 text-sm">🔥</span>}
+                        </div>
+                      </td>
+                      <td className="py-3 px-4 text-center font-bold text-red-600 text-lg">{student.score.toFixed(1)}</td>
+                      <td className="py-3 px-4 text-center text-sm">
+                        <span className="text-green-600 font-bold">{student.totalCorrects}</span>
+                        <span className="text-gray-300 mx-1">/</span>
+                        <span className="text-red-500 font-bold">{student.totalWrongs}</span>
+                      </td>
+                      <td className="py-3 px-4 text-center text-sm text-gray-500">
+                        {student.avgTime === 999 ? '-' : `${student.avgTime.toFixed(1)}s`}
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="flex gap-1 flex-wrap">
+                          {Array.from({ length: questionsCount }).map((_, i) => {
+                            const ans = student.answers && student.answers[i];
+                            let boxClass = "w-6 h-6 rounded-md flex items-center justify-center text-[11px] font-bold text-white transition-all ";
+                            if (!ans) boxClass += "bg-gray-100 border border-gray-200 text-gray-400";
+                            else if (ans.isCorrect) boxClass += "bg-green-500 shadow-sm";
+                            else boxClass += "bg-red-500 shadow-sm";
+
+                            return <div key={i} className={boxClass} title={ans ? `Câu ${i+1}: Chọn ${ans.answer}` : ''}>{ans ? ans.answer : ''}</div>;
+                          })}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {students.length === 0 && (
+                  <tr>
+                    <td colSpan="6" className="text-center py-8 text-gray-500 italic">Chưa có học sinh nào nộp bài...</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    };
+
+    const QuestionDisplay = ({ question, onAnswer, studentAnswer, isRevealed, showTimer, startTime }) => {
+      const [zoomedImg, setZoomedImg] = useState(null);
+      if (!question) return null;
+
+      return (
+        <div className="w-full max-w-4xl mx-auto bg-white rounded-3xl shadow-sm p-6 md:p-10 mb-6 border border-gray-100 animate-fade-in">
+          
+          {showTimer && startTime && !isRevealed && (
+            <TimerBar startTime={startTime} timeLimit={question.timeLimit || 20} />
+          )}
+
+          <div className="flex justify-between items-center mb-6">
+            <span className="bg-green-100 text-green-800 px-4 py-1.5 rounded-full text-sm font-bold shadow-sm">{question.topic}</span>
+            <span className="bg-gray-100 text-gray-600 px-4 py-1.5 rounded-full text-sm font-bold">Câu {question.questionNumber}</span>
+          </div>
+          
+          <h2 className="text-2xl md:text-3xl font-bold text-gray-800 mb-8 leading-relaxed">
+            <ChemText text={question.question} />
+          </h2>
+
+          {question.questionImage && (
+            <div className="mb-8 flex justify-center bg-gray-50 rounded-2xl p-4 border border-gray-100 cursor-pointer hover:shadow-md transition-all" onClick={() => setZoomedImg(question.questionImage)}>
+              <img src={question.questionImage} alt="Hóa Học" className="max-h-[300px] object-contain rounded-xl" />
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {['A', 'B', 'C', 'D'].map((key) => {
+              const opt = question.options[key];
+              if (!opt.text && !opt.image) return null;
+
+              let btnClass = "relative flex flex-col items-center justify-center p-6 rounded-2xl border-2 transition-all duration-200 min-h-[140px] ";
+              
+              if (isRevealed) {
+                if (key === question.correctAnswer) {
+                  btnClass += "border-green-500 bg-green-50 shadow-md ring-4 ring-green-200";
+                } else if (key === studentAnswer) {
+                  btnClass += "border-red-500 bg-red-50 shadow-inner";
+                } else {
+                  btnClass += "border-gray-200 opacity-40 bg-gray-50";
+                }
+              } else {
+                if (studentAnswer) {
+                  if (key === studentAnswer) btnClass += "border-blue-500 bg-blue-50 shadow-md transform scale-[1.02] ring-2 ring-blue-300";
+                  else btnClass += "border-gray-200 opacity-60 bg-gray-50";
+                } else {
+                  btnClass += "border-gray-200 hover:border-green-400 hover:bg-green-50 cursor-pointer hover:-translate-y-1 shadow-sm";
+                }
+              }
+
+              return (
+                <div key={key} onClick={() => !studentAnswer && !isRevealed && onAnswer(key)} className={btnClass}>
+                  <div className={`absolute top-4 left-4 font-extrabold text-lg w-10 h-10 rounded-full border flex items-center justify-center shadow-sm transition-colors ${isRevealed && key === question.correctAnswer ? 'bg-green-500 text-white border-green-500' : 'bg-white border-gray-200 text-gray-700'}`}>
+                    {key}
+                  </div>
+                  <div className="mt-4 w-full flex flex-col items-center justify-center gap-3">
+                    {opt.text && <div className="text-xl text-center font-semibold text-gray-800"><ChemText text={opt.text} /></div>}
+                    {opt.image && (
+                      <img src={opt.image} alt={`Đáp án ${key}`} className="max-h-[160px] object-contain rounded-lg cursor-pointer" onClick={(e) => { e.stopPropagation(); setZoomedImg(opt.image); }} />
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {zoomedImg && <ImageModal src={zoomedImg} onClose={() => setZoomedImg(null)} />}
+        </div>
+      );
+    };
+
+    // ============================================================================
+    // F. GIAO DIỆN GIÁO VIÊN & HỌC SINH
+    // ============================================================================
+
+    const DEFAULT_QUESTIONS = `=== BẮT ĐẦU BỘ CÂU HỎI MÔN HÓA ===
+Chủ đề dẫn xuất halogen: Câu 1 đến Câu 5
+
+Câu 1: Chất nào là dẫn xuất halogen của hydrocarbon?
+A. Cl - CH2 - COOH.
+B. C6H5 - CH2 - Cl.
+C. CH2OH - CH2 - Br.
+D. CH3 - CO - Cl.
+Đáp án đúng: B
+
+Câu 2: Thủy phân CH3Cl thu được sản phẩm có công thức là
+A. CH3OH.
+B. CH4.
+C. CH3ONa.
+D. C2H6.
+Đáp án đúng: A
+
+Câu 3: Đun nóng 2-bromopropane với NaOH trong dung môi alcohol thu được sản phẩm có tên gọi là
+A. Etene.
+B. propene.
+C. ethane.
+D. propane.
+Đáp án đúng: B
+
+Câu 4: Công thức hóa học của Sulfuric acid là gì?
+A. H2SO4
+B. HCl
+C. HNO3
+D. H3PO4
+Đáp án đúng: A
+
+Câu 5: Nhận diện ảnh cấu trúc sau thuộc hợp chất nào?
+[IMAGE: https://upload.wikimedia.org/wikipedia/commons/thumb/1/11/Phenol_chemical_structure.png/200px-Phenol_chemical_structure.png]
+A. Phenol
+B. Ethanol
+C. Benzene
+D. Toluene
+Đáp án đúng: A
+=== KẾT THÚC BỘ CÂU HỎI MÔN HÓA ===`;
+
+    const TeacherDashboard = ({ user, goHome }) => {
+      const [rawText, setRawText] = useState(DEFAULT_QUESTIONS);
+      const [questions, setQuestions] = useState([]);
+      const [roomId, setRoomId] = useState(null);
+      const [roomState, setRoomState] = useState(null);
+      const [errorMsg, setErrorMsg] = useState("");
+      const [copyText, setCopyText] = useState("📋 Copy");
+
+      useEffect(() => {
+        if (!user || !roomId) return;
+        const roomRef = getDbRef(roomId);
+        const unsubscribe = roomRef.onSnapshot((docSnap) => {
+          if (docSnap.exists) {
+            setRoomState(docSnap.data());
+          }
+        });
+        return () => unsubscribe();
+      }, [roomId, user]);
+
+      useEffect(() => {
+        if (roomState?.status === 'playing' && roomState?.phase === 'countdown') {
+          const timer = setTimeout(() => {
+            updateRoom({ phase: 'answering', questionStartTime: Date.now() });
+          }, 3000);
+          return () => clearTimeout(timer);
+        }
+      }, [roomState?.status, roomState?.phase, roomState?.currentQuestionIndex]);
+
+      const handleParse = () => {
+        const parsed = parseQuestions(rawText);
+        setQuestions(parsed);
+      };
+
+      const handleCreateRoom = async () => {
+        if (questions.length === 0) {
+          setErrorMsg("Vui lòng phân tích câu hỏi trước!");
+          return;
+        }
+
+        if (!user && !isLocalDemo) {
+          setErrorMsg("Hệ thống đang tải dữ liệu xác thực, Thầy vui lòng đợi 2-3 giây rồi bấm lại nhé...");
+          return;
+        }
+        
+        setErrorMsg("Đang tạo phòng...");
+
+        try {
+          const newRoomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+          const roomRef = getDbRef(newRoomId);
+          
+          const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Lỗi mạng hoặc Timeout từ máy chủ.")), 8000));
+          
+          await Promise.race([
+            roomRef.set({
+              roomId: newRoomId,
+              teacherId: user?.uid || 'local_teacher',
+              questions,
+              status: 'waiting',
+              phase: 'waiting',
+              currentQuestionIndex: -1,
+              questionStartTime: 0,
+              createdAt: Date.now(),
+              students: {}
+            }),
+            timeout
+          ]);
+          
+          setErrorMsg("");
+          setRoomId(newRoomId);
+        } catch (err) {
+          console.error("Lỗi tạo phòng:", err);
+          setErrorMsg("Lỗi tạo phòng: " + err.message + " (Vui lòng kiểm tra lại kết nối mạng)");
+        }
+      };
+
+      const updateRoom = async (updates) => {
+        if (!roomId) return;
+        try {
+          await getDbRef(roomId).update(updates);
+        } catch (err) {
+          console.error("Lỗi cập nhật phòng:", err);
+        }
+      };
+
+      const handleStartGame = () => {
+        updateRoom({ status: 'playing', phase: 'countdown', currentQuestionIndex: 0, countdownAt: Date.now() });
+      };
+      
+      const handleRevealAnswer = () => {
+        updateRoom({ phase: 'revealed' });
+      };
+
+      const handleNextQuestion = () => {
+        if (!roomState) return;
+        const nextIdx = roomState.currentQuestionIndex + 1;
+        if (nextIdx >= roomState.questions.length) {
+          updateRoom({ status: 'finished', phase: 'finished' });
+        } else {
+          updateRoom({ currentQuestionIndex: nextIdx, phase: 'countdown', countdownAt: Date.now() });
+        }
+      };
+
+      const handleCopyRoomId = () => {
+        if(navigator.clipboard) {
+            navigator.clipboard.writeText(roomId).catch(()=>{});
+        } else {
+            const el = document.createElement('textarea');
+            el.value = roomId;
+            document.body.appendChild(el);
+            el.select();
+            document.execCommand('copy');
+            document.body.removeChild(el);
+        }
+        setCopyText("✅ Đã copy");
+        setTimeout(() => setCopyText("📋 Copy"), 2000);
+      };
+
+      const exportResults = () => {
+        const students = rankStudents(roomState?.students);
+        const csvContent = "data:text/csv;charset=utf-8,Hạng,Tên,Điểm,Số câu đúng,Số câu sai,Tốc độ TB (s)\n"
+          + students.map(s => `${s.rank},${s.name},${s.score},${s.totalCorrects},${s.totalWrongs},${s.avgTime === 999 ? 0 : s.avgTime.toFixed(1)}`).join("\n");
+        const link = document.createElement("a");
+        link.href = encodeURI(csvContent);
+        link.download = `Ket_Qua_Thi_Hoa_${roomId}.csv`;
+        link.click();
+      };
+
+      if (!roomId) {
+        return (
+          <div className="min-h-screen bg-gray-50 py-10">
+            <div className="max-w-5xl mx-auto px-6">
+              <div className="flex items-center gap-4 mb-6">
+                <button onClick={goHome} className="bg-white px-4 py-2 rounded-xl shadow-sm text-gray-600 hover:text-green-600 font-bold">⬅ Quay lại</button>
+                <h1 className="text-3xl font-extrabold text-green-700 flex items-center gap-3">🧪 Quản Lý Đề Thi Hóa Học</h1>
+              </div>
+              
+              <div className="bg-white rounded-3xl shadow-sm p-8 border border-gray-100">
+                <h2 className="text-xl font-bold mb-4 text-gray-800">Nhập bộ câu hỏi môn Hóa học</h2>
+                <textarea
+                  className="w-full h-96 p-5 border-2 border-gray-200 rounded-2xl font-mono text-sm bg-gray-50 focus:ring-4 focus:ring-green-100 focus:border-green-500 outline-none transition-all leading-relaxed"
+                  value={rawText}
+                  onChange={(e) => setRawText(e.target.value)}
+                />
+                
+                {errorMsg && (
+                  <div className={`mt-4 font-bold text-center p-3 rounded-lg ${errorMsg === "Đang tạo phòng..." ? "bg-blue-100 text-blue-700" : "bg-red-100 text-red-700"}`}>
+                    {errorMsg}
+                  </div>
+                )}
+
+                <div className="mt-6 flex gap-4">
+                  <button onClick={handleParse} className="px-8 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 font-bold shadow-md transition-transform hover:-translate-y-1">Phân tích câu hỏi</button>
+                  <button 
+                    onClick={handleCreateRoom} 
+                    disabled={questions.length === 0} 
+                    className={`px-8 py-3 rounded-xl font-bold shadow-md transition-transform ${questions.length === 0 ? 'bg-gray-400 text-gray-200 cursor-not-allowed' : 'bg-green-600 text-white hover:bg-green-700 hover:-translate-y-1'}`}
+                  >
+                    Tạo phòng chơi
+                  </button>
+                </div>
+                {questions.length > 0 && <div className="mt-6 p-4 bg-green-50 border border-green-200 rounded-xl text-green-700 font-bold">✅ Hoàn tất! Nhận diện được {questions.length} câu hỏi hợp lệ.</div>}
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      const studentsList = rankStudents(roomState?.students);
+      const currentQ = roomState?.currentQuestionIndex >= 0 ? roomState.questions[roomState.currentQuestionIndex] : null;
+      
+      const totalStudents = Object.keys(roomState?.students || {}).length;
+      let answeredCount = 0;
+      let correctCount = 0;
+      
+      if (currentQ && roomState?.students) {
+        Object.values(roomState.students).forEach(student => {
+          const ans = student.answers && student.answers[roomState.currentQuestionIndex];
+          if (ans) {
+            answeredCount++;
+            if (ans.isCorrect) correctCount++;
+          }
+        });
+      }
+
+      return (
+        <div className="min-h-screen bg-gray-50 flex flex-col">
+          <header className="bg-green-600 text-white p-5 shadow-lg flex flex-wrap justify-between items-center z-10 gap-4">
+            <div className="text-2xl font-black tracking-widest flex items-center">
+              MÃ PHÒNG: <span className="bg-white text-green-700 px-6 py-2 rounded-xl ml-4 shadow-inner text-3xl">{roomId}</span>
+              <button onClick={handleCopyRoomId} className="ml-3 bg-green-500 hover:bg-green-400 text-white px-4 py-2 rounded-xl text-sm font-bold shadow-md transition-colors" title="Sao chép mã phòng">{copyText}</button>
+            </div>
+            <div className="flex gap-4">
+              {roomState?.status === 'waiting' && <button onClick={handleStartGame} className="bg-yellow-400 text-green-900 px-8 py-3 rounded-xl font-bold hover:bg-yellow-300 shadow-md">BẮT ĐẦU GAME</button>}
+              {roomState?.phase === 'answering' && <button onClick={handleRevealAnswer} className="bg-blue-500 text-white px-8 py-3 rounded-xl font-bold hover:bg-blue-600 shadow-md">HIỆN ĐÁP ÁN</button>}
+              {roomState?.phase === 'revealed' && <button onClick={handleNextQuestion} className="bg-white text-green-700 px-8 py-3 rounded-xl font-bold hover:bg-gray-100 shadow-md">CÂU TIẾP THEO ➡</button>}
+              {roomState?.status === 'finished' && <button onClick={exportResults} className="bg-blue-600 text-white px-8 py-3 rounded-xl font-bold hover:bg-blue-700 shadow-md">📥 XUẤT KẾT QUẢ CSV</button>}
+              <button onClick={goHome} className="bg-green-800 text-white px-4 py-3 rounded-xl font-bold hover:bg-green-900 shadow-md">Thoát</button>
+            </div>
+          </header>
+
+          <main className="flex-1 p-6 flex flex-col gap-8 max-w-[1400px] mx-auto w-full">
+            <div className="bg-white rounded-3xl shadow-sm p-8 text-center border border-gray-100">
+               
+               {roomState?.status === 'waiting' && (
+                 <div>
+                   <h2 className="text-3xl font-black text-gray-800 mb-4">Mời học sinh tham gia phòng thi!</h2>
+                   <div className="mt-4 p-6 bg-green-50 rounded-2xl inline-block border border-green-200 shadow-inner">
+                     <p className="text-xl text-gray-700 font-bold">Số lượng hiện tại: <span className="font-black text-5xl text-green-600 ml-3">{totalStudents}</span></p>
+                   </div>
+                 </div>
+               )}
+
+               {roomState?.status === 'playing' && roomState?.phase === 'countdown' && (
+                 <CountdownScreen countdownAt={roomState.countdownAt} />
+               )}
+
+               {roomState?.status === 'playing' && roomState?.phase === 'answering' && currentQ && (
+                 <div className="animate-fade-in">
+                   <h2 className="text-2xl font-bold text-blue-600 mb-6 flex items-center justify-center gap-2">
+                     <span className="animate-pulse">⏳</span> Học sinh đang làm bài...
+                   </h2>
+                   <div className="flex justify-center gap-8 mb-8">
+                      <div className="bg-gray-100 rounded-2xl p-6 min-w-[200px] border border-gray-200">
+                        <p className="text-gray-500 font-bold mb-1">Đã nộp bài</p>
+                        <p className="text-4xl font-black text-blue-600">{answeredCount} <span className="text-2xl text-gray-400">/ {totalStudents}</span></p>
+                      </div>
+                   </div>
+                   <div className="pointer-events-none">
+                     <QuestionDisplay 
+                        question={currentQ} 
+                        onAnswer={() => {}} 
+                        studentAnswer={null} 
+                        isRevealed={false} 
+                        showTimer={true}
+                        startTime={roomState.questionStartTime}
+                     />
+                   </div>
+                 </div>
+               )}
+
+               {roomState?.status === 'playing' && roomState?.phase === 'revealed' && currentQ && (
+                 <div className="animate-fade-in">
+                   <h2 className="text-3xl font-black text-green-600 mb-6">Kết quả câu {currentQ.questionNumber}</h2>
+                   <div className="flex justify-center gap-6 mb-8">
+                      <div className="bg-green-50 rounded-2xl p-6 min-w-[180px] border border-green-200">
+                        <p className="text-green-800 font-bold mb-1">Trả lời đúng</p>
+                        <p className="text-4xl font-black text-green-600">{correctCount}</p>
+                      </div>
+                      <div className="bg-red-50 rounded-2xl p-6 min-w-[180px] border border-red-200">
+                        <p className="text-red-800 font-bold mb-1">Trả lời sai</p>
+                        <p className="text-4xl font-black text-red-600">{answeredCount - correctCount}</p>
+                      </div>
+                   </div>
+                   <div className="pointer-events-none mt-4">
+                     <QuestionDisplay 
+                        question={currentQ} 
+                        onAnswer={() => {}} 
+                        studentAnswer={null} 
+                        isRevealed={true} 
+                     />
+                   </div>
+                 </div>
+               )}
+
+               {roomState?.status === 'finished' && (
+                 <div>
+                   <h2 className="text-4xl font-black text-green-600 mb-4">🏆 TỔNG KẾT XẾP HẠNG</h2>
+                   <p className="text-gray-500 text-lg">Phòng thi đã kết thúc. Xin chúc mừng các học sinh xuất sắc!</p>
+                 </div>
+               )}
+            </div>
+            
+            {(roomState?.phase === 'revealed' || roomState?.status === 'finished') && (
+               <Leaderboard students={studentsList} questionsCount={roomState?.questions?.length || 0} />
+            )}
+          </main>
+        </div>
+      );
+    };
+
+    const StudentView = ({ user, goHome }) => {
+      const [roomIdInput, setRoomIdInput] = useState('');
+      const [nameInput, setNameInput] = useState('');
+      const [roomId, setRoomId] = useState(null);
+      const [roomState, setRoomState] = useState(null);
+      const [hasAnswered, setHasAnswered] = useState(false);
+      const [selectedAnswer, setSelectedAnswer] = useState(null);
+      const [errorMsg, setErrorMsg] = useState("");
+
+      useEffect(() => {
+        if (!user || !roomId) return;
+        const roomRef = getDbRef(roomId);
+        const unsubscribe = roomRef.onSnapshot((docSnap) => {
+          if (docSnap.exists) {
+            const data = docSnap.data();
+            setRoomState(data);
+            
+            // Reset answer state when entering a new question countdown
+            if (data && data.phase === 'countdown' && data.currentQuestionIndex !== roomState?.currentQuestionIndex) {
+              setHasAnswered(false);
+              setSelectedAnswer(null);
+            }
+          } else {
+            setErrorMsg("Phòng không còn tồn tại.");
+            setRoomId(null);
+          }
+        });
+        return () => unsubscribe();
+      }, [roomId, user, roomState?.currentQuestionIndex]);
+
+      const handleJoin = async (e) => {
+        e.preventDefault();
+        if (!user && !isLocalDemo) {
+          return setErrorMsg("Đang kết nối hệ thống, vui lòng chờ 2 giây rồi thử lại...");
+        }
+        setErrorMsg("Đang tải...");
+        try {
+          const code = roomIdInput.trim().toUpperCase();
+          const roomRef = getDbRef(code);
+          const snap = await roomRef.get();
+          if (!snap.exists) {
+            return setErrorMsg("Mã phòng không đúng hoặc phòng không tồn tại.");
+          }
+          
+          const studentId = user?.uid || `local_student_${Math.random().toString(36).substring(2,8)}`;
+          await roomRef.update({
+            [`students.${studentId}`]: {
+              name: nameInput,
+              score: 0,
+              fastCorrects: 0,
+              totalCorrects: 0,
+              totalWrongs: 0,
+              totalTime: 0,
+              totalQuestionsAnswered: 0,
+              streak: 0,
+              answers: {}
+            }
+          });
+          
+          if(isLocalDemo && !user) {
+             // Mock user id cho session local nếu chưa có
+             user = { uid: studentId };
+          }
+          
+          setErrorMsg("");
+          setRoomId(code);
+        } catch (err) {
+          setErrorMsg("Lỗi kết nối: " + err.message);
+        }
+      };
+
+      const handleAnswer = async (answerKey) => {
+        if (hasAnswered || roomState?.phase !== 'answering' || !user) return;
+        
+        setHasAnswered(true);
+        setSelectedAnswer(answerKey);
+        
+        const currentQ = roomState.questions[roomState.currentQuestionIndex];
+        const timeTaken = (Date.now() - roomState.questionStartTime) / 1000;
+        const { score, isFast, isCorrect } = calculateScore(answerKey, currentQ.correctAnswer, timeTaken, currentQ.timeLimit || 20);
+        
+        try {
+          const studentId = user.uid;
+          const me = roomState.students[studentId];
+          if (!me) return;
+
+          const roomRef = getDbRef(roomId);
+          await roomRef.update({
+            [`students.${studentId}.answers.${roomState.currentQuestionIndex}`]: { answer: answerKey, isCorrect, isFast, timeTaken, scoreEarned: score },
+            [`students.${studentId}.score`]: me.score + score,
+            [`students.${studentId}.totalTime`]: me.totalTime + timeTaken,
+            [`students.${studentId}.totalQuestionsAnswered`]: me.totalQuestionsAnswered + 1,
+            [`students.${studentId}.totalCorrects`]: isCorrect ? me.totalCorrects + 1 : me.totalCorrects,
+            [`students.${studentId}.totalWrongs`]: isCorrect ? me.totalWrongs : me.totalWrongs + 1,
+            [`students.${studentId}.streak`]: isCorrect ? me.streak + 1 : 0,
+            [`students.${studentId}.fastCorrects`]: isFast && isCorrect ? me.fastCorrects + 1 : me.fastCorrects
+          });
+        } catch(err) {
+          console.error("Lỗi khi nộp bài:", err);
+        }
+      };
+
+      if (!roomId) {
+        return (
+          <div className="min-h-screen bg-green-50 flex flex-col items-center justify-center p-4">
+            <button onClick={goHome} className="absolute top-6 left-6 bg-white px-4 py-2 rounded-xl shadow-sm text-gray-600 hover:text-green-600 font-bold">⬅ Trang chủ</button>
+            <form onSubmit={handleJoin} className="bg-white p-10 rounded-[2rem] shadow-2xl w-full max-w-md border border-green-100">
+              <div className="text-center mb-8">
+                <h1 className="text-4xl font-black text-green-600 mb-3 tracking-tight">HÓA HỌC QUIZ</h1>
+                <p className="text-gray-500 font-medium">Nhập thông tin để tham gia phòng thi</p>
+              </div>
+              
+              {errorMsg && (
+                  <div className={`mb-4 font-bold text-center p-3 rounded-lg ${errorMsg === "Đang tải..." ? "bg-blue-100 text-blue-700" : "bg-red-100 text-red-700"}`}>
+                    {errorMsg}
+                  </div>
+              )}
+              
+              <div className="mb-5 text-left">
+                <label className="block text-gray-700 font-bold mb-2 ml-2">Mã phòng thi</label>
+                <input required type="text" placeholder="Ví dụ: ABCDEF" value={roomIdInput} onChange={e => setRoomIdInput(e.target.value)} className="w-full p-4 border-2 border-gray-200 rounded-2xl uppercase text-center font-extrabold tracking-widest text-xl focus:border-green-500 outline-none transition-colors bg-gray-50 focus:bg-white" />
+              </div>
+              
+              <div className="mb-8 text-left">
+                <label className="block text-gray-700 font-bold mb-2 ml-2">Tên học sinh</label>
+                <input required type="text" placeholder="Nhập họ và tên..." value={nameInput} onChange={e => setNameInput(e.target.value)} className="w-full p-4 border-2 border-gray-200 rounded-2xl font-bold text-center text-lg focus:border-green-500 outline-none transition-colors bg-gray-50 focus:bg-white" />
+              </div>
+              
+              <button type="submit" className="w-full bg-green-500 text-white font-extrabold text-xl py-4 rounded-2xl hover:bg-green-600 shadow-xl shadow-green-200 transition-all transform hover:-translate-y-1">VÀO PHÒNG NGAY</button>
+            </form>
+          </div>
+        );
+      }
+
+      if (!roomState) return <div className="p-10 text-center font-bold text-green-600">Đang đồng bộ dữ liệu lớp học...</div>;
+
+      const currentQ = roomState.status === 'playing' ? roomState.questions[roomState.currentQuestionIndex] : null;
+      const me = roomState.students[user?.uid];
+      const allStudents = rankStudents(roomState.students);
+      const myRankInfo = allStudents.find(s => s.id === user?.uid);
+
+      return (
+        <div className="min-h-screen bg-gray-50 flex flex-col">
+          <header className="bg-green-600 text-white p-4 md:p-5 shadow-md flex justify-between items-center sticky top-0 z-10">
+            <div className="font-extrabold text-xl flex items-center gap-2">👨‍🎓 {me?.name || 'Học sinh'}</div>
+            <div className="flex items-center gap-3">
+              <div className="bg-black/20 px-4 py-2 rounded-xl text-sm font-medium">Tổng điểm: <span className="font-black text-yellow-300 text-lg ml-1">{me?.score?.toFixed(1) || 0}</span></div>
+              {myRankInfo && <div className="bg-white text-green-700 px-4 py-2 rounded-xl text-sm font-black shadow-sm hidden sm:block">HẠNG #{myRankInfo.rank}</div>}
+            </div>
+          </header>
+
+          <main className="flex-1 p-4 md:p-8 w-full max-w-5xl mx-auto flex flex-col">
+            {roomState.status === 'waiting' && (
+              <div className="flex-1 flex flex-col items-center justify-center text-center">
+                <div className="w-28 h-28 bg-green-100 rounded-full flex items-center justify-center mb-8 shadow-inner">
+                  <span className="text-5xl animate-bounce">⏳</span>
+                </div>
+                <h2 className="text-3xl font-black text-gray-800 mb-3">Bạn đã có mặt trong phòng!</h2>
+                <p className="text-gray-500 text-lg font-medium">Hãy nhìn lên bảng chiếu, chờ giáo viên bấm bắt đầu...</p>
+                <div className="mt-8 bg-white px-6 py-3 rounded-full shadow border border-gray-100 font-bold text-gray-600">
+                  Đang có {Object.keys(roomState.students).length} bạn cùng tham gia 🔥
+                </div>
+              </div>
+            )}
+
+            {roomState.status === 'playing' && roomState.phase === 'countdown' && (
+               <CountdownScreen countdownAt={roomState.countdownAt} />
+            )}
+
+            {roomState.status === 'playing' && roomState.phase === 'answering' && currentQ && (
+              <div className="w-full flex-1">
+                 <QuestionDisplay 
+                    question={currentQ} 
+                    onAnswer={handleAnswer} 
+                    studentAnswer={selectedAnswer} 
+                    isRevealed={false} 
+                    showTimer={true}
+                    startTime={roomState.questionStartTime}
+                 />
+                 {hasAnswered && (
+                   <div className="mt-6 p-6 rounded-2xl text-center font-bold text-xl shadow-md bg-blue-50 text-blue-800 border border-blue-200 animate-fade-in flex items-center justify-center gap-3">
+                     <span className="animate-spin text-2xl">⏳</span> Đã gửi đáp án {selectedAnswer}. Đang chờ các bạn khác...
+                   </div>
+                 )}
+              </div>
+            )}
+
+            {roomState.status === 'playing' && roomState.phase === 'revealed' && currentQ && (
+              <div className="w-full flex-1 animate-fade-in">
+                 <div className={`mb-6 p-6 rounded-2xl text-center font-black text-2xl shadow-lg ${selectedAnswer === currentQ.correctAnswer ? 'bg-green-500 text-white' : (selectedAnswer ? 'bg-red-500 text-white' : 'bg-gray-500 text-white')}`}>
+                   {selectedAnswer === currentQ.correctAnswer 
+                     ? '🎉 TUYỆT VỜI! ĐÁP ÁN CHÍNH XÁC!' 
+                     : (selectedAnswer ? '❌ SAI RỒI! HÃY CỐ GẮNG Ở CÂU SAU!' : '⏰ HẾT GIỜ! BẠN CHƯA TRẢ LỜI CÂU NÀY!')}
+                 </div>
+                 <QuestionDisplay 
+                    question={currentQ} 
+                    onAnswer={() => {}} 
+                    studentAnswer={selectedAnswer} 
+                    isRevealed={true} 
+                 />
+              </div>
+            )}
+
+            {roomState.status === 'finished' && (
+              <div className="w-full flex-1 flex flex-col gap-8">
+                <div className="bg-white rounded-3xl p-10 text-center shadow-sm border border-gray-100 relative">
+                   <button onClick={goHome} className="absolute top-6 left-6 text-gray-500 font-bold hover:text-green-600">Thoát</button>
+                   <h2 className="text-4xl font-black text-green-600 mb-4">🏁 GAME OVER!</h2>
+                   <p className="text-2xl text-gray-600 mb-2">Chung cuộc bạn xếp hạng <span className="font-black text-gray-900 text-4xl mx-2">#{myRankInfo?.rank}</span></p>
+                   <p className="text-lg text-gray-500 font-medium">Tổng điểm ghi được: <span className="font-bold text-red-500 text-2xl">{me?.score?.toFixed(1) || 0}</span></p>
+                </div>
+                <Leaderboard students={allStudents} questionsCount={roomState.questions.length} />
+              </div>
+            )}
+          </main>
+        </div>
+      );
+    };
+
+    // ============================================================================
+    // G. KHỞI CHẠY ỨNG DỤNG (APP ROOT)
+    // ============================================================================
+
+    const App = () => {
+      const [user, setUser] = useState(null);
+      const [view, setView] = useState('home');
+
+      useEffect(() => {
+        if (isLocalDemo) {
+          setUser({ uid: 'local_teacher_' + Math.random().toString(36).substring(2,8) });
+          return;
+        }
+
+        const initAuth = async () => {
+          try {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+              await auth.signInWithCustomToken(__initial_auth_token);
+            } else {
+              await auth.signInAnonymously();
+            }
+          } catch(e) {
+            console.error("Lỗi đăng nhập Firebase:", e);
+            setUser({ uid: 'guest_' + Math.random().toString(36).substring(2,8) });
+          }
+        };
+        initAuth();
+        const unsubscribe = auth.onAuthStateChanged((u) => {
+           if (u) setUser(u);
+        });
+        return () => unsubscribe();
+      }, []);
+
+      if (view === 'teacher') return <TeacherDashboard user={user} goHome={() => setView('home')} />;
+      if (view === 'student') return <StudentView user={user} goHome={() => setView('home')} />;
+
+      return (
+        <div className="min-h-screen bg-green-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-[2.5rem] shadow-2xl p-12 max-w-lg w-full text-center border border-green-100">
+            <div className="w-24 h-24 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-6 text-5xl">🧪</div>
+            <h1 className="text-4xl font-black text-green-600 mb-4 tracking-tight">HÓA HỌC QUIZ</h1>
+            <p className="text-gray-500 font-medium mb-4 text-lg">Nền tảng thi đua trắc nghiệm realtime dành cho trường THPT</p>
+            
+            {isLocalDemo && (
+              <div className="bg-yellow-50 text-yellow-800 text-sm font-bold p-3 rounded-xl mb-4 border border-yellow-200">
+                ⚡ Đang chạy Chế độ Offline (Thầy có thể mở 2 Tab trình duyệt để Test)
+              </div>
+            )}
+
+            <div className="bg-green-50 border border-green-200 text-green-800 text-sm font-medium p-4 rounded-xl mb-8 text-left">
+              💡 <strong>Hướng dẫn:</strong> Giáo viên tạo phòng trước, sau đó phát mã cho học sinh nhập vào để tham gia trực tiếp.
+            </div>
+            
+            <div className="flex flex-col gap-4">
+              <button onClick={() => setView('student')} className="w-full py-4 bg-green-500 text-white rounded-2xl font-bold text-lg hover:bg-green-600 transition-all shadow-xl shadow-green-200">
+                HỌC SINH VÀO CHƠI
+              </button>
+              <button onClick={() => setView('teacher')} className="w-full py-4 bg-white text-green-600 border-2 border-green-500 rounded-2xl font-bold text-lg hover:bg-green-50 transition-all mt-2">
+                GIÁO VIÊN TẠO PHÒNG
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    };
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
